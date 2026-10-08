@@ -17,10 +17,10 @@ import numpy as np
 import pandas as pd
 
 SITUATIONS = {
-    "on_ball_perimeter": ("onBallPerimeter_averageGravity", "onBallPerimeter_Frames"),
-    "off_ball_perimeter": ("offBallPerimeter_averageGravity", "offBallPerimeter_Frames"),
-    "on_ball_interior": ("onBallInterior_averageGravity", "onBallInterior_Frames"),
-    "off_ball_interior": ("offBallInterior_averageGravity", "offBallInterior_Frames"),
+    "on_ball_perimeter": ("onBallPerimeter_gravity_mean", "onBallPerimeter_total_frames"),
+    "off_ball_perimeter": ("offBallPerimeter_gravity_mean", "offBallPerimeter_total_frames"),
+    "on_ball_interior": ("onBallInterior_gravity_mean", "onBallInterior_total_frames"),
+    "off_ball_interior": ("offBallInterior_gravity_mean", "offBallInterior_total_frames"),
 }
 
 
@@ -38,43 +38,46 @@ def _weighted_average(frame: pd.DataFrame, score: str, weight: str) -> float:
 class GravityRecommender:
     def __init__(self, data_dir: str | Path = ".", min_games: int = 3,
                  min_frames: int = 1000, min_situation_frames: int = 300):
-        base = Path(data_dir)
-        games = pd.read_csv(base / "wnba_gravity_by_game.csv")
-        players = pd.read_csv(base / "wnba_player_lookup.csv")
-        teams = pd.read_csv(base / "wnba_team_lookup.csv")
-        if not (games["Game_ID"].notna().all() and games["playerId"].notna().all()):
-            raise ValueError("Missing Game_ID or playerId in game data")
-        numeric = ["frames", "averageGravity"] + [c for pair in SITUATIONS.values() for c in pair]
-        for c in numeric:
-            games[c] = pd.to_numeric(games[c], errors="coerce")
-        games["playerId"] = games["playerId"].astype(int)
-        games["teamId"] = games["teamId"].astype(int)
-        games["Game_ID"] = games["Game_ID"].astype(int)
-        players["playerId"] = players["playerId"].astype(int)
-        teams["Team_ID"] = teams["Team_ID"].astype(int)
-        self.games = games
-        self.players = players.drop_duplicates("playerId").set_index("playerId")
-        self.teams = teams
+        source = Path(data_dir)
+        csv_path = source if source.is_file() else source / "recommendation_features.csv"
+        data = pd.read_csv(csv_path)
+        required = ["playerId", "Full_Name", "Team_ID", "Team_Abbreviation",
+                    "Team_Full_Name", "total_games", "total_frames", "gravity_mean",
+                    "gravity_std"] + [col for pair in SITUATIONS.values() for col in pair]
+        missing = [c for c in required if c not in data.columns]
+        if missing:
+            raise ValueError(f"Missing columns in recommendation_features.csv: {missing}")
+        data = data.dropna(subset=["playerId", "Team_ID"]).copy()
+        numeric = ["total_games", "total_frames", "gravity_mean", "gravity_std"]
+        numeric += [col for pair in SITUATIONS.values() for col in pair]
+        for col in numeric:
+            data[col] = pd.to_numeric(data[col], errors="coerce")
+        data["playerId"] = data["playerId"].astype(int)
+        data["Team_ID"] = data["Team_ID"].astype(int)
+        if data.duplicated(["Team_ID", "playerId"]).any():
+            raise ValueError("Duplicate player-team profiles in cleaned CSV")
+        self.games = None  # Aggregate file has no Game_ID rows.
+        self.players = data.drop_duplicates("playerId").set_index("playerId")
+        self.teams = (data[["Team_ID", "Team_Abbreviation", "Team_Full_Name"]]
+                      .drop_duplicates("Team_ID").reset_index(drop=True))
         self.min_games = min_games
         self.min_frames = min_frames
         self.min_situation_frames = min_situation_frames
-        self.profiles = self._profiles()
+        self.profiles = self._profiles(data)
 
-    def _profiles(self) -> pd.DataFrame:
-        records = []
-        # Group by team as well as player to avoid mixing stats from trades.
-        for (team, player), g in self.games.groupby(["teamId", "playerId"]):
-            record = {"teamId": int(team), "playerId": int(player),
-                      "games": int(g["Game_ID"].nunique()),
-                      "frames": int(g["frames"].fillna(0).sum()),
-                      "overall": _weighted_average(g, "averageGravity", "frames")}
-            valid = g.loc[g["averageGravity"].notna() & g["frames"].ge(500), "averageGravity"]
-            record["game_std"] = float(valid.std(ddof=0)) if len(valid) >= 2 else np.nan
-            for name, (score, weight) in SITUATIONS.items():
-                record[name] = _weighted_average(g, score, weight)
-                record[name + "_frames"] = int(g[weight].fillna(0).sum())
-            records.append(record)
-        return pd.DataFrame(records)
+    def _profiles(self, data: pd.DataFrame) -> pd.DataFrame:
+        out = pd.DataFrame({
+            "teamId": data["Team_ID"].astype(int),
+            "playerId": data["playerId"].astype(int),
+            "games": data["total_games"].fillna(0).astype(int),
+            "frames": data["total_frames"].fillna(0).astype(int),
+            "overall": data["gravity_mean"],
+            "game_std": data["gravity_std"],
+        })
+        for name, (score, frames) in SITUATIONS.items():
+            out[name] = data[score]
+            out[name + "_frames"] = data[frames].fillna(0).astype(int)
+        return out.reset_index(drop=True)
 
     def _resolve_team(self, team: str | int) -> int:
         if str(team).isdigit():
@@ -106,24 +109,11 @@ class GravityRecommender:
         return str(self.players.loc[pid, "Full_Name"]) if pid in self.players.index else str(pid)
 
     def _absence_exploration(self, team_id: int, star_id: int, candidate_id: int) -> dict:
-        """Descriptive comparison; star missing from records != verified injury/absence."""
-        team_games = set(self.games.loc[self.games.teamId.eq(team_id), "Game_ID"])
-        star_games = set(self.games.loc[(self.games.teamId.eq(team_id)) &
-                                        (self.games.playerId.eq(star_id)), "Game_ID"])
-        candidate = self.games[(self.games.teamId.eq(team_id)) &
-                               (self.games.playerId.eq(candidate_id)) &
-                               self.games.frames.ge(500)]
-        with_star = candidate[candidate.Game_ID.isin(star_games)]
-        without_star = candidate[candidate.Game_ID.isin(team_games - star_games)]
-        a = _weighted_average(with_star, "averageGravity", "frames")
-        b = _weighted_average(without_star, "averageGravity", "frames")
-        enough = len(with_star) >= 2 and len(without_star) >= 2 and np.isfinite(a) and np.isfinite(b)
-        return {"games_with_star": int(len(with_star)),
-                "games_star_not_recorded": int(len(without_star)),
-                "mean_gravity_with_star": _finite(a) if enough else None,
-                "mean_gravity_without_star": _finite(b) if enough else None,
-                "difference": _finite(b-a) if enough else None,
-                "interpretation": "Descriptive only; not evidence of causality or confirmed absence."}
+        """Not computable from one-row-per-player aggregate features."""
+        return {"games_with_star": None, "games_star_not_recorded": None,
+                "mean_gravity_with_star": None, "mean_gravity_without_star": None,
+                "difference": None,
+                "interpretation": "Unavailable: recommendation_features.csv has no game-level appearance data."}
 
     def recommend(self, team: str | int, unavailable: str | int, top_n: int = 3) -> dict:
         team_id = self._resolve_team(team)
@@ -184,8 +174,8 @@ class GravityRecommender:
                 "unavailable_player": self._name(star_id),
                 "unavailable_profile": {k: _finite(star[k]) for k in features},
                 "recommendations": results[:max(0, top_n)],
-                "method": "Frame-weighted team-season Gravity profiles, standardized distance, situation coverage and sample-size adjustment. Fit scores are relative heuristics, not probabilities.",
-                "caution": "Players with no game record are not necessarily injured; with/without comparisons are observational."}
+                "method": "Precomputed player-level Gravity profiles from recommendation_features.csv, standardized distance, situation coverage and sample-size adjustment. Fit scores are relative heuristics, not probabilities.",
+                "caution": "This aggregate dataset cannot establish star absences or with/without-star effects. Team membership is taken from the cleaned CSV."}
 
 
 def recommend_replacements(team_id: str | int, unavailable_player_id: str | int,
