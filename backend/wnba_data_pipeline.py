@@ -27,11 +27,11 @@ warnings.filterwarnings("ignore")
 # 1. LOAD ALL 5 DATASETS
 # ──────────────────────────────────────────────
 print("Loading datasets...")
-players = pd.read_csv("wnba_player_lookup.csv")
-teams = pd.read_csv("wnba_team_lookup.csv")
-leaderboard = pd.read_csv("wnba_gravity_season_leaderboards.csv")
-by_game = pd.read_csv("wnba_gravity_by_game.csv")
-sample = pd.read_csv("wnba_gravity_sample.csv")
+players = pd.read_csv("../wnba_player_lookup.csv")
+teams = pd.read_csv("../wnba_team_lookup.csv")
+leaderboard = pd.read_csv("../wnba_gravity_season_leaderboards.csv")
+by_game = pd.read_csv("../wnba_gravity_by_game.csv")
+sample = pd.read_csv("../wnba_gravity_sample.csv")
 
 print(f"  Players:      {players.shape}")
 print(f"  Teams:        {teams.shape}")
